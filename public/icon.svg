@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="chassisGrad" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#2d3436"/>
+      <stop offset="100%" stop-color="#111417"/>
+    </radialGradient>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff6b81"/>
+      <stop offset="100%" stop-color="#ff4757"/>
+    </linearGradient>
+    <linearGradient id="metalBezel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f0f2f5"/>
+      <stop offset="100%" stop-color="#babecc"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Rounded Square Chassis (App Icon Shape) -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#chassisGrad)" stroke="url(#metalBezel)" stroke-width="8"/>
+
+  <!-- Industrial Screw Fasteners at 4 Corners -->
+  <g fill="#2d3436" stroke="#babecc" stroke-width="2">
+    <!-- Top-Left Screw -->
+    <circle cx="64" cy="64" r="14"/>
+    <line x1="56" y1="64" x2="72" y2="64" stroke="#e0e5ec" stroke-width="3"/>
+    <!-- Top-Right Screw -->
+    <circle cx="448" cy="64" r="14"/>
+    <line x1="440" y1="56" x2="456" y2="72" stroke="#e0e5ec" stroke-width="3"/>
+    <!-- Bottom-Left Screw -->
+    <circle cx="64" cy="448" r="14"/>
+    <line x1="56" y1="440" x2="72" y2="456" stroke="#e0e5ec" stroke-width="3"/>
+    <!-- Bottom-Right Screw -->
+    <circle cx="448" cy="448" r="14"/>
+    <line x1="440" y1="448" x2="456" y2="448" stroke="#e0e5ec" stroke-width="3"/>
+  </g>
+
+  <!-- Radar Concentric Rings -->
+  <circle cx="256" cy="256" r="180" fill="none" stroke="#334155" stroke-width="2" stroke-dasharray="6 6"/>
+  <circle cx="256" cy="256" r="130" fill="none" stroke="#475569" stroke-width="2"/>
+  <circle cx="256" cy="256" r="80" fill="none" stroke="#64748b" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <!-- Tactical Reticle Crosshairs -->
+  <line x1="256" y1="50" x2="256" y2="462" stroke="#475569" stroke-width="2" stroke-dasharray="8 8"/>
+  <line x1="50" y1="256" x2="462" y2="256" stroke="#475569" stroke-width="2" stroke-dasharray="8 8"/>
+
+  <!-- Central Emergency Command Shield -->
+  <path d="M256 100 L380 155 V280 C380 355 320 415 256 435 C192 415 132 355 132 280 V155 Z" 
+        fill="url(#shieldGrad)" stroke="#ffffff" stroke-width="8" filter="url(#glow)"/>
+
+  <!-- Inner Hazard Pulse Symbol (Cyclone & Flash Inundation Waves) -->
+  <g fill="#ffffff">
+    <!-- Hazard Warning Triangle -->
+    <polygon points="256,160 320,270 192,270" fill="#1e272e"/>
+    <polygon points="256,180 306,262 206,262" fill="#ff4757"/>
+    <!-- Exclamation Point -->
+    <rect x="251" y="200" width="10" height="34" rx="4" fill="#ffffff"/>
+    <circle cx="256" cy="248" r="5.5" fill="#ffffff"/>
+
+    <!-- Radio / Waves Broadcast Arcs below Triangle -->
+    <path d="M190 310 C210 330 302 330 322 310" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <path d="M214 336 C226 350 286 350 298 336" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="256" cy="365" r="7" fill="#ffffff"/>
+  </g>
+
+  <!-- Real-Time Online Status LED (Green Pulsing in Top Bar) -->
+  <circle cx="256" cy="64" r="8" fill="#22c55e" filter="url(#glow)"/>
+  <circle cx="256" cy="64" r="3" fill="#ffffff"/>
+</svg>

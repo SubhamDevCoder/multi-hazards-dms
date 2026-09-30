@@ -1,0 +1,6 @@
+{
+  "name": "Multi-Hazard Disaster Command System",
+  "description": "Industrial skeuomorphic command console for multi-hazard disaster management, real-time telemetry ingestion, explainable risk prediction, evacuation routing, and resource planning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
