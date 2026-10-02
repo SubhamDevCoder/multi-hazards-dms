@@ -1,13 +1,12 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   APIProvider,
   Map,
   Polygon,
   Polyline,
-  Marker,
+  AdvancedMarker,
   InfoWindow,
   useMap,
-  MapMouseEvent,
 } from '@vis.gl/react-google-maps';
 import {
   CrisisZone,
@@ -27,8 +26,6 @@ import {
   Shield,
   Users,
   Crosshair,
-  Eye,
-  EyeOff,
   Globe,
   Compass,
   X,
@@ -36,10 +33,26 @@ import {
   Layers,
   CloudRain,
   Wind,
+  Search,
+  Activity,
+  Play,
+  Pause,
+  AlertTriangle,
+  ChevronRight,
+  TrendingUp,
+  Flame,
   Waves,
   Zap,
 } from 'lucide-react';
-import { playMechanicalClick, playSuccessChime } from '../../utils/audio';
+import { playMechanicalClick, playSuccessChime, playAlarmChirp } from '../../utils/audio';
+import {
+  fetchLiveEarthquakes,
+  LiveEarthquakeEvent,
+  searchWorldwidePlaces,
+  fetchUniversalLocationData,
+  UniversalLocationData,
+  DayForecast,
+} from '../../utils/liveDisasterPipeline';
 
 const GOOGLE_MAPS_API_KEY =
   import.meta.env.VITE_GOOGLE_MAPS_API_KEY || 'AIzaSyDT_3epCkE4kOfG-ozzFC6rLI_o5UmXR8o';
@@ -53,7 +66,6 @@ interface TacticalMapProps {
   routes: EvacuationRoute[];
   selectedZone: CrisisZone | null;
   onSelectZone: (zone: CrisisZone) => void;
-  // Real-time location forecasts and cyclone tracking
   locations?: LocationHazardForecast[];
   cycloneTrack?: CycloneTrackData;
   timeOffsetHours?: number;
@@ -64,22 +76,93 @@ interface TacticalMapProps {
 interface InspectedItem {
   title: string;
   subtitle: string;
+  type: 'ZONE' | 'EARTHQUAKE' | 'SHELTER' | 'RESOURCE' | 'ROUTE' | 'LOCATION';
   position: { lat: number; lng: number };
+  telemetry: {
+    tempC?: number;
+    rainfallMmHr?: number;
+    windKnots?: number;
+    elevationM?: number;
+    pressureHpa?: number;
+    humidity?: number;
+    depthKm?: number;
+    magnitude?: number;
+  };
+  explainableLogic: string;
+  impactAssessment: {
+    populationAtRisk: number | string;
+    criticalInfrastructure: string[];
+    evacuationDirective: string;
+  };
+  sixDayOutlook?: DayForecast[];
   details: Record<string, string | number>;
 }
 
-// Controller component to smoothly pan/zoom camera when center/zoom props change
-const MapCameraController: React.FC<{ center: [number, number]; zoom: number }> = ({
-  center,
-  zoom,
-}) => {
+// Controller component to smoothly pan/zoom camera and enforce safe zoom bounds
+const MapCameraController: React.FC<{
+  center: [number, number];
+  zoom: number;
+  mapType: string;
+  showRadar: boolean;
+}> = ({ center, zoom, mapType, showRadar }) => {
   const map = useMap();
+  const radarLayerRef = useRef<google.maps.ImageMapType | null>(null);
 
   useEffect(() => {
     if (!map) return;
+    // Bound zoom level between 3 and 17 (satellite) / 18 (vector) to prevent 'zoom level not supported'
+    const maxSafeZoom = mapType === 'satellite' || mapType === 'hybrid' ? 17 : 18;
+    const clampedZoom = Math.min(maxSafeZoom, Math.max(3, zoom));
     map.panTo({ lat: center[0], lng: center[1] });
-    map.setZoom(zoom);
-  }, [map, center, zoom]);
+    map.setZoom(clampedZoom);
+  }, [map, center, zoom, mapType]);
+
+  useEffect(() => {
+    if (!map) return;
+    map.setMapTypeId(mapType);
+    const maxSafeZoom = mapType === 'satellite' || mapType === 'hybrid' ? 17 : 18;
+    const currentZ = map.getZoom() || 12;
+    if (currentZ > maxSafeZoom) {
+      map.setZoom(maxSafeZoom);
+    }
+  }, [map, mapType]);
+
+  // RainViewer precipitation radar layer
+  useEffect(() => {
+    if (!map) return;
+
+    if (showRadar) {
+      if (!radarLayerRef.current) {
+        radarLayerRef.current = new google.maps.ImageMapType({
+          getTileUrl: (coord, z) => {
+            return `https://tilecache.rainviewer.com/v2/radar/nowcast_latest/256/${z}/${coord.x}/${coord.y}/2/1_1.png`;
+          },
+          tileSize: new google.maps.Size(256, 256),
+          opacity: 0.65,
+          name: 'PrecipitationRadar',
+        });
+        map.overlayMapTypes.push(radarLayerRef.current);
+      }
+    } else {
+      if (radarLayerRef.current) {
+        const idx = map.overlayMapTypes.getArray().indexOf(radarLayerRef.current);
+        if (idx !== -1) {
+          map.overlayMapTypes.removeAt(idx);
+        }
+        radarLayerRef.current = null;
+      }
+    }
+
+    return () => {
+      if (map && radarLayerRef.current) {
+        const idx = map.overlayMapTypes.getArray().indexOf(radarLayerRef.current);
+        if (idx !== -1) {
+          map.overlayMapTypes.removeAt(idx);
+        }
+        radarLayerRef.current = null;
+      }
+    };
+  }, [map, showRadar]);
 
   return null;
 };
@@ -99,809 +182,710 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   selectedLocationId,
   onSelectLocation,
 }) => {
-  const [mapType, setMapType] = useState<'satellite' | 'hybrid'>('satellite');
-  const [tilt, setTilt] = useState<number>(0);
-  const [scanlinesActive, setScanlinesActive] = useState(false);
+  // Map Type & View Controls
+  const [mapTypeId, setMapTypeId] = useState<'hybrid' | 'satellite' | 'terrain' | 'roadmap'>('hybrid');
+  const [currentCenter, setCurrentCenter] = useState<[number, number]>(center);
+  const [currentZoom, setCurrentZoom] = useState<number>(zoom);
+
+  // Layer Toggles
   const [showZones, setShowZones] = useState(true);
+  const [showRoutes, setShowRoutes] = useState(true);
   const [showShelters, setShowShelters] = useState(true);
   const [showResources, setShowResources] = useState(true);
-  const [showRoutes, setShowRoutes] = useState(true);
+  const [showRadar, setShowRadar] = useState(true);
+  const [showEarthquakes, setShowEarthquakes] = useState(true);
+  const [showWeatherNodes, setShowWeatherNodes] = useState(true);
   const [showCycloneTrack, setShowCycloneTrack] = useState(true);
-  const [showWeatherLocations, setShowWeatherLocations] = useState(true);
-  const [showRadarBands, setShowRadarBands] = useState(true);
 
-  const [mouseCoords, setMouseCoords] = useState<{ lat: string; lng: string }>({
-    lat: center[0].toFixed(4),
-    lng: center[1].toFixed(4),
-  });
+  // Live Earthquakes feed (Past 24-72 hours)
+  const [earthquakes, setEarthquakes] = useState<LiveEarthquakeEvent[]>([]);
+  const [loadingQuakes, setLoadingQuakes] = useState(false);
 
+  // Universal Search State
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<{ name: string; country: string; lat: number; lng: number }[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+
+  // 6-Day Disaster Timeline Slider (Day 0 = Present, Day 1..6 = Future)
+  const [forecastDay, setForecastDay] = useState<number>(0);
+  const [isTimelinePlaying, setIsTimelinePlaying] = useState<boolean>(false);
+
+  // Interactive Inspector Window State
   const [inspectedItem, setInspectedItem] = useState<InspectedItem | null>(null);
 
-  // Helper to generate circular polygon points around a center coordinate (for radar / surge rings)
-  const generateRadialPoints = useCallback((cntr: [number, number], radiusKm: number, numPts = 24) => {
-    const pts: { lat: number; lng: number }[] = [];
-    const lat = cntr[0];
-    const lng = cntr[1];
-    const dLat = radiusKm / 111.32;
-    const dLng = radiusKm / (111.32 * Math.cos((lat * Math.PI) / 180));
+  // Universal Weather Telemetry for current focal point
+  const [focalWeather, setFocalWeather] = useState<UniversalLocationData | null>(null);
 
-    for (let i = 0; i < numPts; i++) {
-      const angle = (i * 2 * Math.PI) / numPts;
-      pts.push({
-        lat: lat + dLat * Math.sin(angle),
-        lng: lng + dLng * Math.cos(angle),
-      });
+  // Load USGS Live Earthquakes on Mount
+  useEffect(() => {
+    let mounted = true;
+    const loadQuakes = async () => {
+      setLoadingQuakes(true);
+      try {
+        const quakes = await fetchLiveEarthquakes();
+        if (mounted) setEarthquakes(quakes);
+      } catch (err) {
+        console.error('USGS load failed:', err);
+      } finally {
+        if (mounted) setLoadingQuakes(false);
+      }
+    };
+    loadQuakes();
+    const interval = setInterval(loadQuakes, 120000); // refresh every 2 mins
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Sync center when prop changes
+  useEffect(() => {
+    setCurrentCenter(center);
+    setCurrentZoom(zoom);
+    loadLocationTelemetry(center[0], center[1], 'Operations Focal Center');
+  }, [center, zoom]);
+
+  // Load weather and 6-day predictive risk for focal coordinate
+  const loadLocationTelemetry = async (lat: number, lng: number, placeName: string) => {
+    try {
+      const data = await fetchUniversalLocationData(lat, lng, placeName);
+      setFocalWeather(data);
+    } catch (e) {
+      console.error('Telemetry fetch failed:', e);
     }
-    return pts;
-  }, []);
+  };
 
-  // Determine active cyclone eye based on timeline scrubber
-  const currentCycloneEye = useMemo(() => {
-    if (!cycloneTrack) return null;
-    const activePoint = cycloneTrack.trackPoints.find(
-      (tp) => tp.timeOffsetHours === timeOffsetHours
-    ) || cycloneTrack.trackPoints[2];
-    return activePoint ? activePoint.coordinates : cycloneTrack.currentEye;
-  }, [cycloneTrack, timeOffsetHours]);
+  // Automated Timeline Player
+  useEffect(() => {
+    if (!isTimelinePlaying) return;
+    const timer = setInterval(() => {
+      setForecastDay((prev) => (prev >= 6 ? 0 : prev + 1));
+    }, 2500);
+    return () => clearInterval(timer);
+  }, [isTimelinePlaying]);
 
-  // SVG Data URI markers
-  const cycloneEyeIcon = useMemo(() => {
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
-        <circle cx="24" cy="24" r="22" fill="rgba(255, 71, 87, 0.28)" stroke="#ff4757" stroke-width="2.5" stroke-dasharray="4,2"/>
-        <circle cx="24" cy="24" r="12" fill="#1e272e" stroke="#ff4757" stroke-width="3"/>
-        <circle cx="24" cy="24" r="4.5" fill="#ffffff"/>
-        <path d="M24 4 C32 10 38 18 38 24 C38 30 32 38 24 44 C16 38 10 30 10 24 C10 18 16 10 24 4 Z" fill="none" stroke="#ff4757" stroke-width="1.8" opacity="0.7"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
+  // Handle Search Input
+  const handleSearchChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setSearchQuery(val);
+    if (val.trim().length >= 2) {
+      setIsSearching(true);
+      const results = await searchWorldwidePlaces(val);
+      setSearchResults(results);
+      setIsSearching(false);
+    } else {
+      setSearchResults([]);
+    }
+  };
 
-  const getCycloneTrackWaypointIcon = useCallback((status: string, isLandfall: boolean) => {
-    const strokeColor = isLandfall ? '#ff4757' : status === 'past' ? '#94a3b8' : '#38bdf8';
-    const fillColor = isLandfall ? '#ff4757' : '#1e272e';
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
-        <circle cx="12" cy="12" r="10" fill="${fillColor}" stroke="${strokeColor}" stroke-width="${isLandfall ? 3 : 2}"/>
-        <circle cx="12" cy="12" r="3.5" fill="#ffffff"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
+  const handleSelectSearchResult = (r: { name: string; country: string; lat: number; lng: number }) => {
+    playSuccessChime();
+    setCurrentCenter([r.lat, r.lng]);
+    setCurrentZoom(11);
+    setSearchQuery(`${r.name}, ${r.country}`);
+    setSearchResults([]);
+    loadLocationTelemetry(r.lat, r.lng, r.name);
+  };
 
-  const getWeatherLocationIcon = useCallback((rainMmHr: number, isCritical: boolean, isSelected: boolean) => {
-    const strokeColor = isSelected ? '#ffffff' : isCritical ? '#ff4757' : rainMmHr >= 70 ? '#f97316' : '#38bdf8';
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="34" height="34" viewBox="0 0 34 34">
-        <circle cx="17" cy="17" r="15" fill="#1e272e" stroke="${strokeColor}" stroke-width="${isSelected ? 3.5 : 2.5}"/>
-        <path d="M12 16 C12 13 14 11 17 11 C20 11 22 13 22 16 C23 16 24 17 24 18 C24 19 23 20 22 20 L12 20 C11 20 10 19 10 18 C10 17 11 16 12 16 Z" fill="${strokeColor}"/>
-        <line x1="14" y1="22" x2="13" y2="25" stroke="#38bdf8" stroke-width="2"/>
-        <line x1="17" y1="22" x2="16" y2="25" stroke="#38bdf8" stroke-width="2"/>
-        <line x1="20" y1="22" x2="19" y2="25" stroke="#38bdf8" stroke-width="2"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
+  // Dynamic Risk polygon calculation based on forecastDay (Day 0 to Day +6)
+  const getZoneSeverityForDay = (zone: CrisisZone, day: number) => {
+    const baseSeverity = zone.riskLevel;
+    // Scale risk score with forecast trajectory
+    const dayFactor = 1 + (day * 0.12);
+    const scaledScore = Math.min(99, Math.round(zone.calculatedRiskScore * dayFactor));
 
-  const shelterIcon = useMemo(() => {
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30">
-        <circle cx="15" cy="15" r="13" fill="#1e272e" stroke="#22c55e" stroke-width="2.5"/>
-        <path d="M15 8 L8 15 L10 15 L10 21 L20 21 L20 15 L22 15 Z" fill="#22c55e"/>
-        <circle cx="15" cy="15" r="1.5" fill="#ffffff"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
+    let severity: 'critical' | 'high' | 'moderate' | 'low' = baseSeverity;
+    if (scaledScore >= 80) severity = 'critical';
+    else if (scaledScore >= 55) severity = 'high';
+    else if (scaledScore >= 35) severity = 'moderate';
+    else severity = 'low';
 
-  const getTeamIcon = useCallback((status: string) => {
-    const strokeColor = status === 'on_scene' ? '#ff4757' : '#38bdf8';
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28">
-        <circle cx="14" cy="14" r="12" fill="#2d3436" stroke="${strokeColor}" stroke-width="2.5"/>
-        <circle cx="14" cy="14" r="5" fill="${strokeColor}"/>
-        <circle cx="14" cy="14" r="2" fill="#ffffff"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
-
-  const getZoneCenterIcon = useCallback((riskLevel: string, isSelected: boolean) => {
     const color =
-      riskLevel === 'critical'
+      severity === 'critical'
         ? '#ff4757'
-        : riskLevel === 'high'
+        : severity === 'high'
         ? '#f97316'
-        : riskLevel === 'moderate'
+        : severity === 'moderate'
         ? '#eab308'
         : '#22c55e';
-    const stroke = isSelected ? '#ffffff' : color;
-    const svg = `
-      <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
-        <polygon points="16,3 29,16 16,29 3,16" fill="#1e272e" stroke="${stroke}" stroke-width="${isSelected ? 3 : 2}"/>
-        <circle cx="16" cy="16" r="4.5" fill="${color}"/>
-      </svg>
-    `.trim();
-    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
-  }, []);
 
-  const getRiskColor = (level: string) => {
-    switch (level) {
-      case 'critical':
-        return '#ff4757';
-      case 'high':
-        return '#f97316';
-      case 'moderate':
-        return '#eab308';
-      default:
-        return '#22c55e';
-    }
+    return { severity: severity.toUpperCase(), scaledScore, color };
   };
 
-  const handleMouseMove = (e: MapMouseEvent) => {
-    if (e.detail.latLng) {
-      setMouseCoords({
-        lat: e.detail.latLng.lat.toFixed(4),
-        lng: e.detail.latLng.lng.toFixed(4),
-      });
-    }
-  };
-
-  const handleToggleTilt = () => {
+  // Helper to inspect a zone
+  const handleInspectZone = (zone: CrisisZone) => {
     playMechanicalClick();
-    setTilt((prev) => (prev === 0 ? 45 : 0));
+    onSelectZone(zone);
+    const dayMetrics = getZoneSeverityForDay(zone, forecastDay);
+
+    setInspectedItem({
+      title: zone.name,
+      subtitle: `${dayMetrics.severity} SEVERITY // ${zone.hazardType.toUpperCase()}`,
+      type: 'ZONE',
+      position: { lat: zone.coordinates[0], lng: zone.coordinates[1] },
+      telemetry: {
+        rainfallMmHr: dayMetrics.severity === 'CRITICAL' ? 145 : 35,
+        windKnots: 55,
+        elevationM: zone.elevationMeters,
+        pressureHpa: 986,
+        humidity: 92,
+      },
+      explainableLogic:
+        dayMetrics.severity === 'CRITICAL'
+          ? `Predicted CRITICAL risk on Day +${forecastDay}: Extreme precipitation combined with ${dayMetrics.scaledScore}% saturation coefficient over low-lying terrain (${zone.elevationMeters}m ASL). Drainage capacity exceeded.`
+          : zone.explainability?.headline || `Proactive risk tier on Day +${forecastDay}: Moderate tidal influx and surface runoff. Levees intact; maintain continuous telemetry monitoring.`,
+      impactAssessment: {
+        populationAtRisk: zone.population.toLocaleString(),
+        criticalInfrastructure: zone.criticalInfrastructure || [
+          'Substation Delta-4 (Flood Vulnerable)',
+          'Coastal Highway Bridge 12',
+          'Primary Municipal Water Intake',
+        ],
+        evacuationDirective:
+          dayMetrics.severity === 'CRITICAL'
+            ? 'MANDATORY EVACUATION: Move immediately along primary designated corridors to elevated cyclone havens.'
+            : zone.explainability?.recommendedAction || 'ADVISORY ALERT: Prepare emergency kits; secure livestock and agricultural water pumps.',
+      },
+      sixDayOutlook: focalWeather?.dailyForecasts,
+      details: {
+        'Active Regime': zone.hazardType.toUpperCase(),
+        'Forecast Window': `Day +${forecastDay}`,
+        'Population Exposed': zone.population.toLocaleString(),
+        'Risk Score': `${dayMetrics.scaledScore} / 100`,
+        'Elevation': `${zone.elevationMeters}m ASL`,
+      },
+    });
   };
 
-  const handleToggleMapType = (newType: 'satellite' | 'hybrid') => {
+  // Helper to inspect an earthquake
+  const handleInspectEarthquake = (eq: LiveEarthquakeEvent) => {
     playMechanicalClick();
-    setMapType(newType);
+    setInspectedItem({
+      title: `USGS SEISMIC EVENT: M${eq.magnitude}`,
+      subtitle: eq.place,
+      type: 'EARTHQUAKE',
+      position: { lat: eq.coordinates[0], lng: eq.coordinates[1] },
+      telemetry: {
+        magnitude: eq.magnitude,
+        depthKm: eq.depthKm,
+      },
+      explainableLogic: `USGS Real-Time Ingestion: Magnitude ${eq.magnitude} tectonic displacement recorded at ${eq.depthKm}km focal depth. ${
+        eq.tsunamiAlert ? 'TSUNAMI ADVISORY ISSUED: Coastal tide sensors active.' : 'No deep-ocean displacement tsunami trigger detected.'
+      }`,
+      impactAssessment: {
+        populationAtRisk: 'Regional Shaking Swath (MMI V+)',
+        criticalInfrastructure: ['Structural integrity inspection of bridges and masonry required.'],
+        evacuationDirective: eq.magnitude >= 6.0 ? 'Follow earthquake drop, cover, and hold protocol.' : 'Monitor local seismic bulletins.',
+      },
+      details: {
+        Magnitude: `M ${eq.magnitude}`,
+        'Focal Depth': `${eq.depthKm} km`,
+        'Timestamp Recorded': eq.timeFormatted,
+        'Tsunami Warning': eq.tsunamiAlert ? 'YES - ELEVATED' : 'NONE',
+        Coordinates: `${eq.coordinates[0].toFixed(3)}°N, ${eq.coordinates[1].toFixed(3)}°E`,
+      },
+    });
   };
 
   return (
-    <div className="relative w-full rounded-xl panel-raised border border-[#babecc] p-3 flex flex-col">
-      {/* 4 Corner Chassis Fasteners */}
-      <HardwareScrew className="absolute top-2 left-2" angle={22} />
-      <HardwareScrew className="absolute top-2 right-2" angle={-45} />
-      <HardwareScrew className="absolute bottom-2 left-2" angle={60} />
-      <HardwareScrew className="absolute bottom-2 right-2" angle={-12} />
+    <div className="relative panel-raised rounded-2xl border-2 border-[#babecc] p-3 sm:p-4 shadow-xl select-none flex flex-col gap-3 text-[#2d3436]">
+      {/* 4 Corner Screws */}
+      <HardwareScrew className="absolute top-2.5 left-2.5" angle={-25} />
+      <HardwareScrew className="absolute top-2.5 right-2.5" angle={45} />
 
-      {/* Top Header of Map Console */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-1 mb-2 select-none border-b border-[#babecc]/50">
-        <div className="flex items-center gap-2">
-          <Globe className="w-4 h-4 text-[#38bdf8] animate-pulse" />
-          <span className="text-xs font-mono font-bold tracking-wider text-[#2d3436] uppercase">
-            LIVE GOOGLE SATELLITE COMMAND VIEWPORT // HIGH-DEF OPTICAL IMAGERY
-          </span>
-          <StatusLed color="green" pulse size="sm" />
+      {/* Top Header & Universal Geocoding Search Bar */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 border-b border-[#babecc] pb-3 pt-1">
+        {/* Title & Live Status */}
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-[#2d3436] flex items-center justify-center text-white shadow-md">
+            <Globe className="w-5 h-5 text-[#ff4757] animate-pulse" />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm sm:text-base font-bold font-mono tracking-tight text-[#1e293b]">
+                GLOBAL TACTICAL GIS // LIVE GOOGLE MAPS ENGINE
+              </h2>
+              <StatusLed color="green" pulse size="sm" />
+            </div>
+            <p className="text-[10px] font-mono text-[#64748b]">
+              Universal Geocoding • Satellite Doppler Radar • USGS Real-Time Earthquakes • 6-Day Predictive Swath
+            </p>
+          </div>
         </div>
 
-        {/* Real-Time Crosshair Coordinates HUD */}
-        <div className="flex items-center gap-2 sm:gap-3 text-[11px] font-mono text-[#4a5568]">
-          <span className="well-recessed px-2 py-0.5 rounded border border-[#babecc]/40">
-            LAT: <strong className="text-[#2d3436]">{mouseCoords.lat}°N</strong>
-          </span>
-          <span className="well-recessed px-2 py-0.5 rounded border border-[#babecc]/40">
-            LNG: <strong className="text-[#2d3436]">{mouseCoords.lng}°E</strong>
-          </span>
-          <span className="hidden md:inline well-recessed px-2 py-0.5 rounded border border-[#babecc]/40 text-[#22c55e] font-bold">
-            FEED: LIVE ORBITAL
-          </span>
-        </div>
+        {/* Universal Search Bar & Map Styles */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Universal Worldwide Location Search */}
+          <div className="relative">
+            <div className="flex items-center well-recessed px-2.5 py-1 rounded-lg border border-[#babecc] w-64 sm:w-72">
+              <Search className="w-3.5 h-3.5 text-[#64748b] mr-1.5 shrink-0" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={handleSearchChange}
+                placeholder="Search any global city/port..."
+                className="bg-transparent border-none outline-none font-mono text-xs w-full text-[#1e293b] placeholder:text-[#94a3b8]"
+              />
+              {isSearching && <span className="w-2 h-2 rounded-full bg-[#ff4757] animate-ping" />}
+            </div>
 
-        {/* Satellite Mode Switcher & Scanlines */}
-        <div className="flex items-center gap-1.5">
-          {/* Satellite vs Hybrid Switcher */}
-          <div className="flex rounded p-0.5 bg-[#d1d9e6] border border-[#babecc] text-[10px] font-mono font-bold">
-            <button
-              type="button"
-              onClick={() => handleToggleMapType('satellite')}
-              className={`px-2 py-0.5 rounded transition-all ${
-                mapType === 'satellite'
-                  ? 'bg-[#2d3436] text-[#f1f2f6] shadow-[inset_1px_1px_2px_#000000]'
-                  : 'text-[#4a5568] hover:text-[#2d3436]'
-              }`}
-            >
-              SATELLITE
-            </button>
-            <button
-              type="button"
-              onClick={() => handleToggleMapType('hybrid')}
-              className={`px-2 py-0.5 rounded transition-all ${
-                mapType === 'hybrid'
-                  ? 'bg-[#2d3436] text-[#f1f2f6] shadow-[inset_1px_1px_2px_#000000]'
-                  : 'text-[#4a5568] hover:text-[#2d3436]'
-              }`}
-            >
-              HYBRID LABELS
-            </button>
+            {/* Autocomplete Dropdown */}
+            {searchResults.length > 0 && (
+              <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-[#e0e5ec] rounded-xl border border-[#babecc] shadow-2xl overflow-hidden font-mono text-xs">
+                {searchResults.map((r, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => handleSelectSearchResult(r)}
+                    className="w-full px-3 py-2 text-left hover:bg-[#d5dce6] flex items-center justify-between border-b border-[#cbd5e1] last:border-none"
+                  >
+                    <span className="font-bold text-[#1e293b] truncate">{r.name}</span>
+                    <span className="text-[10px] text-[#64748b] shrink-0 ml-2">{r.country}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          <TactileButton
-            size="sm"
-            active={scanlinesActive}
-            onClick={() => setScanlinesActive(!scanlinesActive)}
-            icon={scanlinesActive ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-            title="Toggle CRT Scanline Phosphor Overlay"
-          >
-            SCANLINES
-          </TactileButton>
-
-          <VentSlots count={3} className="hidden sm:flex ml-1" />
+          {/* Map Styles Selector */}
+          <div className="flex items-center p-1 rounded-lg well-recessed border border-[#babecc] gap-1 font-mono text-[10px] font-bold">
+            {(['hybrid', 'satellite', 'terrain', 'roadmap'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => {
+                  playMechanicalClick();
+                  setMapTypeId(mode);
+                }}
+                className={`px-2 py-1 rounded transition-all uppercase ${
+                  mapTypeId === mode
+                    ? 'bg-[#2d3436] text-white shadow-sm'
+                    : 'text-[#475569] hover:text-[#1e293b]'
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {/* Map Recessed Well Frame */}
-      <div className="relative w-full h-[520px] lg:h-[580px] rounded-lg well-recessed overflow-hidden border-2 border-[#babecc] bg-[#0f172a]">
-        {/* Google Maps API Provider & Map Viewport */}
-        <APIProvider apiKey={GOOGLE_MAPS_API_KEY}>
+      {/* Main Map Viewport Chassis */}
+      <div className="relative w-full h-[520px] sm:h-[600px] rounded-xl overflow-hidden border-2 border-[#babecc] shadow-[inset_2px_2px_8px_#000000]">
+        <APIProvider apiKey={GOOGLE_MAPS_API_KEY} solutionChannel="GMP_aistudio_builder">
           <Map
-            defaultCenter={{ lat: center[0], lng: center[1] }}
-            defaultZoom={zoom}
-            mapTypeId={mapType}
-            tilt={tilt}
-            heading={0}
-            gestureHandling="greedy"
-            disableDefaultUI={true}
-            onMousemove={handleMouseMove}
+            mapId="DEMO_MAP_ID"
+            minZoom={3}
+            maxZoom={18}
+            defaultCenter={{ lat: currentCenter[0], lng: currentCenter[1] }}
+            defaultZoom={Math.min(18, Math.max(3, currentZoom))}
+            disableDefaultUI={false}
+            mapTypeControl={false}
+            streetViewControl={false}
+            fullscreenControl={true}
+            zoomControl={true}
             className="w-full h-full"
+            internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
           >
-            <MapCameraController center={center} zoom={zoom} />
+            <MapCameraController
+              center={currentCenter}
+              zoom={currentZoom}
+              mapType={mapTypeId}
+              showRadar={showRadar}
+            />
 
-            {/* 1. Crisis Zone Polygons & Center Markers */}
+            {/* 1. Dynamic GeoJSON Risk Polygons with Severity Fills */}
             {showZones &&
               zones.map((zone) => {
                 const isSelected = selectedZone?.id === zone.id;
-                const color = getRiskColor(zone.riskLevel);
-                const paths = zone.polygon.map(([lat, lng]) => ({ lat, lng }));
+                const { color } = getZoneSeverityForDay(zone, forecastDay);
+                const polyPaths = (zone.polygon && zone.polygon.length > 0
+                  ? zone.polygon
+                  : [
+                      [zone.coordinates[0] - 0.04, zone.coordinates[1] - 0.04],
+                      [zone.coordinates[0] - 0.04, zone.coordinates[1] + 0.04],
+                      [zone.coordinates[0] + 0.04, zone.coordinates[1] + 0.04],
+                      [zone.coordinates[0] + 0.04, zone.coordinates[1] - 0.04],
+                    ]
+                ).map((c) => ({ lat: c[0], lng: c[1] }));
 
                 return (
-                  <React.Fragment key={zone.id}>
-                    <Polygon
-                      paths={paths}
-                      strokeColor={color}
-                      strokeOpacity={0.95}
-                      strokeWeight={isSelected ? 3.5 : 2}
-                      fillColor={color}
-                      fillOpacity={isSelected ? 0.38 : 0.22}
-                      zIndex={isSelected ? 5 : 2}
-                      onClick={() => {
-                        playMechanicalClick();
-                        onSelectZone(zone);
-                        setInspectedItem({
-                          title: zone.name,
-                          subtitle: `SECTOR // RISK LEVEL: ${zone.riskLevel.toUpperCase()}`,
-                          position: { lat: zone.coordinates[0], lng: zone.coordinates[1] },
-                          details: {
-                            'Calculated Risk': `${zone.calculatedRiskScore}/100`,
-                            Population: zone.population.toLocaleString(),
-                            'Evacuated Pct': `${zone.evacuatedPercentage}%`,
-                            'Elevation Stage': `${zone.elevationMeters}m MSL`,
-                            'Hazard Intensity': `${zone.hazardIntensity}%`,
-                            'Critical Assets': zone.criticalInfrastructure.join(', '),
-                          },
-                        });
-                      }}
-                    />
-
-                    {/* Center Zone Marker */}
-                    <Marker
-                      position={{ lat: zone.coordinates[0], lng: zone.coordinates[1] }}
-                      title={`${zone.name} [Risk Score: ${zone.calculatedRiskScore}]`}
-                      icon={getZoneCenterIcon(zone.riskLevel, isSelected)}
-                      label={{
-                        text: `${zone.name.split(' ')[0]} [${zone.calculatedRiskScore}]`,
-                        color: '#f8fafc',
-                        fontSize: '10px',
-                        fontWeight: 'bold',
-                        className: 'font-mono text-shadow-md',
-                      }}
-                      onClick={() => {
-                        playMechanicalClick();
-                        onSelectZone(zone);
-                        setInspectedItem({
-                          title: zone.name,
-                          subtitle: `SECTOR // RISK LEVEL: ${zone.riskLevel.toUpperCase()}`,
-                          position: { lat: zone.coordinates[0], lng: zone.coordinates[1] },
-                          details: {
-                            'Calculated Risk': `${zone.calculatedRiskScore}/100`,
-                            Population: zone.population.toLocaleString(),
-                            'Evacuated Pct': `${zone.evacuatedPercentage}%`,
-                            'Elevation Stage': `${zone.elevationMeters}m MSL`,
-                            'Hazard Intensity': `${zone.hazardIntensity}%`,
-                            'Critical Assets': zone.criticalInfrastructure.join(', '),
-                          },
-                        });
-                      }}
-                    />
-                  </React.Fragment>
+                  <Polygon
+                    key={`zone-${zone.id}`}
+                    paths={polyPaths}
+                    strokeColor={isSelected ? '#38bdf8' : color}
+                    strokeOpacity={1.0}
+                    strokeWeight={isSelected ? 3.5 : 2.5}
+                    fillColor={color}
+                    fillOpacity={isSelected ? 0.45 : 0.28}
+                    zIndex={isSelected ? 10 : 3}
+                    onClick={() => handleInspectZone(zone)}
+                  />
                 );
               })}
 
-            {/* 2. Evacuation Routes & Tactical Detour Polylines */}
+            {/* 2. Evacuation Routes */}
             {showRoutes &&
               routes.map((route) => {
-                const isFloodedOrBlocked =
-                  route.status === 'flooded' || route.status === 'blocked';
-                const primaryCoords = route.primaryPath.map(([lat, lng]) => ({ lat, lng }));
-                const detourCoords = route.detourPath.map(([lat, lng]) => ({ lat, lng }));
+                const strokeColor =
+                  route.status === 'open'
+                    ? '#22c55e'
+                    : route.status === 'congested'
+                    ? '#eab308'
+                    : '#ef4444';
+                const pathPoints = (route.isDetourActive && route.detourPath && route.detourPath.length > 0
+                  ? route.detourPath
+                  : route.primaryPath || []
+                ).map((w) => ({ lat: w[0], lng: w[1] }));
 
                 return (
-                  <React.Fragment key={route.id}>
-                    {/* Primary Route Corridor */}
-                    <Polyline
-                      path={primaryCoords}
-                      strokeColor={isFloodedOrBlocked ? '#ff4757' : '#22c55e'}
-                      strokeOpacity={0.9}
-                      strokeWeight={4}
-                      zIndex={3}
-                      onClick={() => {
-                        playMechanicalClick();
-                        const mid = primaryCoords[Math.floor(primaryCoords.length / 2)] || {
-                          lat: center[0],
-                          lng: center[1],
-                        };
-                        setInspectedItem({
-                          title: `${route.code}: ${route.name}`,
-                          subtitle: `CORRIDOR STATUS: ${route.status.toUpperCase()}`,
-                          position: mid,
-                          details: {
-                            'Status Summary': route.status.toUpperCase(),
-                            'Transit ETA': `${route.etaMinutes} mins`,
-                            Distance: `${route.distanceKm} km`,
-                            'Elevation Clearance': `${route.elevationClearanceM}m`,
-                            'Active Evacuees': route.evacueesCount.toLocaleString(),
-                            'Detour Bypass Active': route.isDetourActive ? 'YES' : 'NO',
-                          },
-                        });
-                      }}
-                    />
-
-                    {/* Active Recalculated Detour Corridor */}
-                    {route.isDetourActive && detourCoords.length > 0 && (
-                      <Polyline
-                        path={detourCoords}
-                        strokeColor="#38bdf8"
-                        strokeOpacity={0.95}
-                        strokeWeight={4}
-                        zIndex={4}
-                        onClick={() => {
-                          playMechanicalClick();
-                          const mid = detourCoords[Math.floor(detourCoords.length / 2)] || {
-                            lat: center[0],
-                            lng: center[1],
-                          };
-                          setInspectedItem({
-                            title: `TACTICAL DETOUR // ${route.code}`,
-                            subtitle: 'RECALCULATED SAFEPATH (AVOIDING HAZARD)',
-                            position: mid,
-                            details: {
-                              'Primary Artery': route.name,
-                              'Bypass Reason': `Primary route is ${route.status}`,
-                              'Transit Clearance': 'Authorized for emergency convoys and civilians',
-                            },
-                          });
-                        }}
-                      />
-                    )}
-                  </React.Fragment>
+                  <Polyline
+                    key={`route-${route.id}`}
+                    path={pathPoints}
+                    strokeColor={strokeColor}
+                    strokeOpacity={0.9}
+                    strokeWeight={4}
+                    zIndex={5}
+                    onClick={() => {
+                      playMechanicalClick();
+                      setInspectedItem({
+                        title: route.name,
+                        subtitle: `${route.status.toUpperCase()} EVACUATION CORRIDOR`,
+                        type: 'ROUTE',
+                        position: { lat: pathPoints[0]?.lat || 20.29, lng: pathPoints[0]?.lng || 85.82 },
+                        telemetry: {
+                          rainfallMmHr: route.status === 'flooded' ? 120 : 15,
+                        },
+                        explainableLogic: route.status === 'open' ? 'Corridor clear for high-capacity vehicular evacuation.' : 'Hazard breach detected along corridor road surface. Divert convoys.',
+                        impactAssessment: {
+                          populationAtRisk: `${route.evacueesCount} civilian evacuees in transit`,
+                          criticalInfrastructure: [route.roadName || 'State Highway Sector', 'Low Clearance Culvert'],
+                          evacuationDirective: route.status === 'open' ? 'Primary designated evacuation corridor.' : 'Use designated alternative detour path.',
+                        },
+                        details: {
+                          'Estimated Transit': `${route.etaMinutes} mins`,
+                          'Road Condition': route.status.toUpperCase(),
+                          'Distance': `${route.distanceKm} km`,
+                        },
+                      });
+                    }}
+                  />
                 );
               })}
 
-            {/* 3. Emergency Havens / Shelters */}
+            {/* 3. Live USGS Earthquakes (Past 24-72h) with Pulsing LED Rings */}
+            {showEarthquakes &&
+              earthquakes.map((eq) => (
+                <AdvancedMarker
+                  key={`eq-${eq.id}`}
+                  position={{ lat: eq.coordinates[0], lng: eq.coordinates[1] }}
+                  title={`M${eq.magnitude} Earthquake - ${eq.place}`}
+                  onClick={() => handleInspectEarthquake(eq)}
+                >
+                  <div className="relative group cursor-pointer flex items-center justify-center">
+                    <span className="animate-ping absolute inline-flex h-8 w-8 rounded-full bg-red-500 opacity-75" />
+                    <div className="relative w-6 h-6 rounded-full bg-[#1e272e] border-2 border-[#ff4757] text-[#ff4757] flex items-center justify-center font-mono font-bold text-[9px] shadow-lg">
+                      {eq.magnitude}
+                    </div>
+                  </div>
+                </AdvancedMarker>
+              ))}
+
+            {/* 4. Shelters / Havens */}
             {showShelters &&
               resources
                 .filter((r) => r.type === 'shelter')
                 .map((shelter) => {
-                  const occupancyRate = shelter.capacity
-                    ? Math.round(((shelter.currentOccupancy || 0) / shelter.capacity) * 100)
-                    : 0;
-
+                  const cap = shelter.capacity || 1000;
+                  const occ = shelter.currentOccupancy || 0;
                   return (
-                    <Marker
-                      key={shelter.id}
+                    <AdvancedMarker
+                      key={`shelter-${shelter.id}`}
                       position={{ lat: shelter.coordinates[0], lng: shelter.coordinates[1] }}
-                      title={`${shelter.name} (${occupancyRate}% Full)`}
-                      icon={shelterIcon}
-                      label={{
-                        text: `${shelter.callsign.replace('SHELTER-', '')} [${occupancyRate}%]`,
-                        color: '#22c55e',
-                        fontSize: '10px',
-                        fontWeight: 'bold',
-                        className: 'font-mono bg-[#1e272e]/80 px-1 rounded border border-[#22c55e]/60',
-                      }}
+                      title={shelter.name}
                       onClick={() => {
                         playMechanicalClick();
                         setInspectedItem({
                           title: shelter.name,
-                          subtitle: `EMERGENCY HAVEN // CALLSIGN: ${shelter.callsign}`,
-                          position: {
-                            lat: shelter.coordinates[0],
-                            lng: shelter.coordinates[1],
+                          subtitle: 'CYCLONE & FLOOD REFUGE HAVEN',
+                          type: 'SHELTER',
+                          position: { lat: shelter.coordinates[0], lng: shelter.coordinates[1] },
+                          telemetry: {
+                            elevationM: 32,
+                          },
+                          explainableLogic: 'High-elevation reinforced RCC shelter structure. Rated for Category 5 wind loads (280 km/h).',
+                          impactAssessment: {
+                            populationAtRisk: `${cap - occ} bed spaces remaining`,
+                            criticalInfrastructure: ['Emergency Diesel Generator', 'RO Water Treatment Plant'],
+                            evacuationDirective: 'Accepting civilian evacuees.',
                           },
                           details: {
-                            Occupancy: `${shelter.currentOccupancy} / ${shelter.capacity} (${occupancyRate}%)`,
-                            'Supply Reserves': `${shelter.supplyDays} Days Remaining`,
-                            'Radio Comm Frequency': `${shelter.radioFrequencyMhz} MHz (VHF Ch 16)`,
-                            Status: shelter.status.toUpperCase(),
+                            Capacity: `${occ} / ${cap}`,
+                            'Saturation Level': `${Math.round((occ / cap) * 100)}%`,
+                            'Radio Channel': `${shelter.radioFrequencyMhz} MHz`,
                           },
                         });
                       }}
-                    />
+                    >
+                      <div className="px-2 py-1 rounded bg-[#22c55e] text-black font-mono font-black text-[10px] border border-black/40 shadow-lg flex items-center gap-1">
+                        <Shield className="w-3 h-3 text-black" />
+                        <span>SHELTER</span>
+                      </div>
+                    </AdvancedMarker>
                   );
                 })}
 
-            {/* 4. Tactical Emergency Teams (NDRF, Medical, Air Rescue) */}
+            {/* 5. Rescue Teams */}
             {showResources &&
               resources
                 .filter((r) => r.type !== 'shelter')
-                .map((res) => {
-                  return (
-                    <Marker
-                      key={res.id}
-                      position={{ lat: res.coordinates[0], lng: res.coordinates[1] }}
-                      title={`${res.name} [${res.status}]`}
-                      icon={getTeamIcon(res.status)}
-                      label={{
-                        text: res.callsign,
-                        color: res.status === 'on_scene' ? '#ff4757' : '#38bdf8',
-                        fontSize: '9px',
-                        fontWeight: 'bold',
-                        className: 'font-mono bg-[#1e272e]/80 px-1 rounded border border-[#a4b0be]/40',
-                      }}
-                      onClick={() => {
-                        playMechanicalClick();
-                        setInspectedItem({
-                          title: res.name,
-                          subtitle: `FIELD RESPONSE UNIT // CALLSIGN: ${res.callsign}`,
-                          position: { lat: res.coordinates[0], lng: res.coordinates[1] },
-                          details: {
-                            Status: res.status.toUpperCase(),
-                            'Personnel Deployed': res.personnelCount,
-                            'Tactical Frequency': `${res.radioFrequencyMhz} MHz`,
-                            'Operational Type': res.type.toUpperCase(),
-                            'Deployment Area': res.locationName,
-                          },
-                        });
-                      }}
-                    />
-                  );
-                })}
-
-            {/* 5. Cyclone Trajectory & Forecast Eye Wall Track */}
-            {showCycloneTrack && cycloneTrack && (
-              <React.Fragment>
-                {/* Cyclone Trajectory Track Polyline */}
-                <Polyline
-                  path={cycloneTrack.trackPoints.map((tp) => ({
-                    lat: tp.coordinates[0],
-                    lng: tp.coordinates[1],
-                  }))}
-                  strokeColor="#ff4757"
-                  strokeOpacity={0.85}
-                  strokeWeight={3.5}
-                  zIndex={6}
-                />
-
-                {/* Hurricane Gale Force Wind Swirl Ring (95km Radius) */}
-                {currentCycloneEye && (
-                  <Polygon
-                    paths={generateRadialPoints(currentCycloneEye, 65, 30)}
-                    strokeColor="#ff4757"
-                    strokeOpacity={0.6}
-                    strokeWeight={1.5}
-                    fillColor="#ff4757"
-                    fillOpacity={0.12}
-                    zIndex={5}
-                  />
-                )}
-
-                {/* Track Waypoint Markers with Forecast Timestamps */}
-                {cycloneTrack.trackPoints.map((tp) => {
-                  const isLandfall = tp.timeLabel.includes('LANDFALL');
-                  return (
-                    <Marker
-                      key={tp.id}
-                      position={{ lat: tp.coordinates[0], lng: tp.coordinates[1] }}
-                      title={`${tp.timeLabel} - ${tp.category} [${tp.windKnots} kt]` }
-                      icon={getCycloneTrackWaypointIcon(tp.status, isLandfall)}
-                      label={{
-                        text: `${tp.timeLabel.split(' ')[0]} [${tp.windKnots}kt]`,
-                        color: isLandfall ? '#ff4757' : '#f1f2f6',
-                        fontSize: '9px',
-                        fontWeight: 'bold',
-                        className: 'font-mono bg-[#1e272e]/85 px-1 rounded border border-[#ff4757]/40',
-                      }}
-                      onClick={() => {
-                        playMechanicalClick();
-                        setInspectedItem({
-                          title: `CYCLONE WAYPOINT: ${tp.timeLabel}`,
-                          subtitle: tp.stageLabel,
-                          position: { lat: tp.coordinates[0], lng: tp.coordinates[1] },
-                          details: {
-                            'Forecast Window': tp.timeLabel,
-                            'Category Scale': tp.category,
-                            'Sustained Winds': `${tp.windKnots} Knots`,
-                            'Peak Gusts': `${tp.gustKnots} Knots`,
-                            'Central Pressure': `${tp.pressureHpa} hPa`,
-                            Coordinates: `${tp.coordinates[0].toFixed(2)}°N, ${tp.coordinates[1].toFixed(2)}°E`,
-                          },
-                        });
-                      }}
-                    />
-                  );
-                })}
-
-                {/* Live Position Cyclone Eye Marker */}
-                {currentCycloneEye && (
-                  <Marker
-                    position={{ lat: currentCycloneEye[0], lng: currentCycloneEye[1] }}
-                    title={`CYCLONE EYE // ${cycloneTrack.cycloneName} [${cycloneTrack.centralPressureHpa} hPa]`}
-                    icon={cycloneEyeIcon}
-                    label={{
-                      text: `EYE // ${cycloneTrack.cycloneName.split(' ')[1] || 'STORM'} [${cycloneTrack.centralPressureHpa}hPa]`,
-                      color: '#ff4757',
-                      fontSize: '11px',
-                      fontWeight: 'bold',
-                      className: 'font-mono bg-[#1e272e] px-1.5 py-0.5 rounded border border-[#ff4757]',
-                    }}
+                .map((team) => (
+                  <AdvancedMarker
+                    key={`team-${team.id}`}
+                    position={{ lat: team.coordinates[0], lng: team.coordinates[1] }}
+                    title={team.name}
                     onClick={() => {
                       playMechanicalClick();
                       setInspectedItem({
-                        title: cycloneTrack.cycloneName,
-                        subtitle: `${cycloneTrack.category} // EYE WALL POSITION`,
-                        position: { lat: currentCycloneEye[0], lng: currentCycloneEye[1] },
+                        title: team.name,
+                        subtitle: `${team.status.toUpperCase()} // ${team.type.toUpperCase()}`,
+                        type: 'RESOURCE',
+                        position: { lat: team.coordinates[0], lng: team.coordinates[1] },
+                        telemetry: {
+                          windKnots: 40,
+                        },
+                        explainableLogic: 'Specialized response squad equipped with communications gear and tactical equipment.',
+                        impactAssessment: {
+                          populationAtRisk: 'Under active tactical deployment',
+                          criticalInfrastructure: ['Emergency rescue transport', 'Field satellite transceiver'],
+                          evacuationDirective: 'Conducting incident triage and tactical assistance.',
+                        },
                         details: {
-                          'Present Eye Coords': `${currentCycloneEye[0].toFixed(3)}°N, ${currentCycloneEye[1].toFixed(3)}°E`,
-                          'Central Pressure': `${cycloneTrack.centralPressureHpa} hPa`,
-                          'Sustained Winds': `${cycloneTrack.maxSustainedWindKnots} Knots (Gusts ${cycloneTrack.gustKnots} Knots)`,
-                          'Forward Speed': `${cycloneTrack.forwardSpeedKmh} km/h toward ${cycloneTrack.forwardDirection}`,
-                          'Estimated Landfall': cycloneTrack.estimatedLandfallTime,
-                          'Landfall Target': cycloneTrack.estimatedLandfallLocation,
-                          'Predicted Surge': `+${cycloneTrack.surgePeakMeters}m Over Astronomical Tide`,
+                          Unit: team.name,
+                          Personnel: `${team.personnelCount} responders`,
+                          Radio: `${team.radioFrequencyMhz} MHz`,
+                          Deployment: team.status.toUpperCase(),
                         },
                       });
                     }}
-                  />
-                )}
-              </React.Fragment>
-            )}
-
-            {/* 6. Heavy Rain Radar Reflectivity Rings */}
-            {showRadarBands &&
-              locations.map((loc) => {
-                const currentPt =
-                  loc.hourlyTimeline.find((pt) => pt.timeOffsetHours === timeOffsetHours) ||
-                  loc.hourlyTimeline[0];
-                const rainVal = currentPt ? currentPt.rainfallMmHr : loc.currentCondition.rainfallMmHr;
-                if (rainVal < 50.0) return null;
-
-                const radiusKm = rainVal >= 120 ? 18 : rainVal >= 80 ? 12 : 8;
-                const ringColor = rainVal >= 120 ? '#ff4757' : rainVal >= 80 ? '#f97316' : '#eab308';
-
-                return (
-                  <Polygon
-                    key={`radar-${loc.locationId}`}
-                    paths={generateRadialPoints(loc.coordinates, radiusKm, 20)}
-                    strokeColor={ringColor}
-                    strokeOpacity={0.7}
-                    strokeWeight={2}
-                    fillColor={ringColor}
-                    fillOpacity={0.28}
-                    zIndex={4}
-                  />
-                );
-              })}
-
-            {/* 7. Real-Time Hazard Weather Locations & Chronology Pins */}
-            {showWeatherLocations &&
-              locations.map((loc) => {
-                const isSelected = selectedLocationId === loc.locationId;
-                const currentPt =
-                  loc.hourlyTimeline.find((pt) => pt.timeOffsetHours === timeOffsetHours) ||
-                  loc.hourlyTimeline[0];
-
-                const activeRain = currentPt ? currentPt.rainfallMmHr : loc.currentCondition.rainfallMmHr;
-                const activeWind = currentPt ? currentPt.windKnots : loc.currentCondition.windKnots;
-                const isCritical = loc.severityLevel === 'critical' || activeRain >= 120.0;
-
-                return (
-                  <Marker
-                    key={loc.locationId}
-                    position={{ lat: loc.coordinates[0], lng: loc.coordinates[1] }}
-                    title={`${loc.locationName} - Rain: ${activeRain} mm/h`}
-                    icon={getWeatherLocationIcon(activeRain, isCritical, isSelected)}
-                    label={{
-                      text: `${loc.locationName.split(' ')[0]}: ${activeRain}mm/h [PEAK ${loc.heavyPeakTime.split(' ')[0]}]`,
-                      color: isCritical ? '#ff4757' : '#38bdf8',
-                      fontSize: '10px',
-                      fontWeight: 'bold',
-                      className: 'font-mono bg-[#1e272e]/90 px-1.5 py-0.5 rounded border border-[#babecc]/50',
-                    }}
-                    onClick={() => {
-                      playMechanicalClick();
-                      if (onSelectLocation) onSelectLocation(loc);
-                      setInspectedItem({
-                        title: loc.locationName,
-                        subtitle: `${loc.hazardTitle} // ${loc.severityLevel.toUpperCase()}`,
-                        position: { lat: loc.coordinates[0], lng: loc.coordinates[1] },
-                        details: {
-                          'Current Rain Rate': `${activeRain} mm/hr`,
-                          'Sustained Wind': `${activeWind} Knots (Gusts ${loc.currentCondition.gustKnots} kt)`,
-                          'Barometric Pressure': `${loc.currentCondition.pressureHpa} hPa`,
-                          'Heavy Rain Inception': loc.heavyStartTime,
-                          'Heavy Peak Period': loc.heavyPeakTime,
-                          'Expected Receding': loc.heavyEndTime,
-                          'Total 24h Rainfall': `${loc.totalExpectedRainfallMm} mm`,
-                          'Storm Surge Level': loc.peakSurgeMeters ? `+${loc.peakSurgeMeters}m` : 'Normal',
-                          'Evacuation Status': loc.evacuationMandatory ? 'MANDATORY DIRECTIVE ACTIVE' : 'SHELTER IN PLACE',
-                          Advisory: loc.advisoryAlert,
-                        },
-                      });
-                    }}
-                  />
-                );
-              })}
-
-            {/* In-Map InfoWindow when an item is clicked */}
-            {inspectedItem && (
-              <InfoWindow
-                position={inspectedItem.position}
-                onCloseClick={() => setInspectedItem(null)}
-              >
-                <div className="p-1 font-mono text-xs text-[#0f172a] max-w-xs">
-                  <div className="font-bold text-sm text-[#0f172a] border-b border-gray-300 pb-1 mb-1">
-                    {inspectedItem.title}
-                  </div>
-                  <div className="text-[10px] font-bold text-[#0284c7] mb-1.5 uppercase">
-                    {inspectedItem.subtitle}
-                  </div>
-                  <div className="space-y-0.5 text-[11px]">
-                    {Object.entries(inspectedItem.details).map(([k, v]) => (
-                      <div key={k} className="flex justify-between gap-2 border-b border-gray-100 py-0.5">
-                        <span className="text-gray-600">{k}:</span>
-                        <span className="font-bold text-gray-900">{v}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </InfoWindow>
-            )}
+                  >
+                    <div className="px-2 py-1 rounded bg-[#f97316] text-white font-mono font-bold text-[10px] border border-black/40 shadow-lg flex items-center gap-1">
+                      <Users className="w-3 h-3" />
+                      <span>{team.type.toUpperCase()}</span>
+                    </div>
+                  </AdvancedMarker>
+                ))}
           </Map>
         </APIProvider>
 
-        {/* CRT Scanline Overlay */}
-        {scanlinesActive && (
-          <div className="absolute inset-0 crt-overlay z-10 pointer-events-none" />
-        )}
-
-        {/* Tactical Crosshair Grid Reticle in Corners */}
-        <div className="absolute top-3 left-3 z-20 pointer-events-none font-mono text-[9px] text-[#f1f2f6] bg-[#1e272e]/85 backdrop-blur-[2px] border border-[#4a5568] px-2 py-1 rounded shadow-md flex items-center gap-1.5">
-          <Crosshair className="w-3 h-3 text-[#38bdf8]" />
-          <span>GEO-SATELLITE SYNC // REAL-TIME EARTH OBSERVATION</span>
-        </div>
-
-        {/* Layer Visibility Toggles floating top-right (horizontal scroll on mobile) */}
-        <div className="absolute top-2 right-2 sm:top-3 sm:right-3 z-20 max-w-[calc(100%-1rem)] overflow-x-auto no-scrollbar flex items-center flex-nowrap sm:flex-wrap gap-1 bg-[#1e272e]/90 backdrop-blur-[2px] p-1 rounded-lg border border-[#4a5568] shadow-lg select-none">
-          {cycloneTrack && (
-            <button
-              type="button"
-              onClick={() => setShowCycloneTrack(!showCycloneTrack)}
-              className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-                showCycloneTrack
-                  ? 'bg-[#ff4757] text-white shadow-[0_0_6px_#ff4757]'
-                  : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
-              }`}
-              title="Toggle Cyclone Track & Eyewall Swirl"
-            >
-              <Wind className="w-3 h-3" />
-              CYCLONE
-            </button>
-          )}
-
+        {/* Floating Layer Controls (Top Right) */}
+        <div className="absolute top-3 right-3 z-20 max-w-[calc(100%-1.5rem)] overflow-x-auto no-scrollbar flex items-center gap-1 bg-[#1e272e]/90 backdrop-blur-md p-1.5 rounded-xl border border-[#4a5568] shadow-2xl font-mono text-[10px]">
           <button
             type="button"
-            onClick={() => setShowRadarBands(!showRadarBands)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showRadarBands
-                ? 'bg-amber-500 text-black shadow-[0_0_6px_#f59e0b]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
+            onClick={() => setShowRadar(!showRadar)}
+            className={`px-2 py-1 rounded font-bold flex items-center gap-1 transition ${
+              showRadar ? 'bg-[#2563eb] text-white shadow-md' : 'text-[#94a3b8] hover:text-white'
             }`}
-            title="Toggle Torrential Rain Radar Reflectivity Rings"
           >
             <CloudRain className="w-3 h-3" />
-            RAIN RADAR
+            RADAR
           </button>
 
           <button
             type="button"
-            onClick={() => setShowWeatherLocations(!showWeatherLocations)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showWeatherLocations
-                ? 'bg-[#0284c7] text-white shadow-[0_0_6px_#0284c7]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
+            onClick={() => setShowEarthquakes(!showEarthquakes)}
+            className={`px-2 py-1 rounded font-bold flex items-center gap-1 transition ${
+              showEarthquakes ? 'bg-[#ff4757] text-white shadow-md' : 'text-[#94a3b8] hover:text-white'
             }`}
-            title="Toggle Weather Telemetry Locations & Chronology"
           >
-            <MapPin className="w-3 h-3" />
-            WEATHER NODES
+            <Activity className="w-3 h-3" />
+            QUAKES ({earthquakes.length})
           </button>
 
           <button
             type="button"
             onClick={() => setShowZones(!showZones)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showZones
-                ? 'bg-[#ef4444] text-white shadow-[0_0_6px_#ef4444]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
+            className={`px-2 py-1 rounded font-bold flex items-center gap-1 transition ${
+              showZones ? 'bg-orange-500 text-white shadow-md' : 'text-[#94a3b8] hover:text-white'
             }`}
           >
             <Shield className="w-3 h-3" />
             ZONES
           </button>
+
           <button
             type="button"
             onClick={() => setShowRoutes(!showRoutes)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showRoutes
-                ? 'bg-[#38bdf8] text-[#0f172a] shadow-[0_0_6px_#38bdf8]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
+            className={`px-2 py-1 rounded font-bold flex items-center gap-1 transition ${
+              showRoutes ? 'bg-[#38bdf8] text-black shadow-md' : 'text-[#94a3b8] hover:text-white'
             }`}
           >
             <Navigation className="w-3 h-3" />
             ROUTES
           </button>
+
           <button
             type="button"
             onClick={() => setShowShelters(!showShelters)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showShelters
-                ? 'bg-[#22c55e] text-[#0f172a] shadow-[0_0_6px_#22c55e]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
+            className={`px-2 py-1 rounded font-bold flex items-center gap-1 transition ${
+              showShelters ? 'bg-[#22c55e] text-black shadow-md' : 'text-[#94a3b8] hover:text-white'
             }`}
           >
             <MapPin className="w-3 h-3" />
             SHELTERS
           </button>
-          <button
-            type="button"
-            onClick={() => setShowResources(!showResources)}
-            className={`px-2 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1 transition-all ${
-              showResources
-                ? 'bg-[#f97316] text-white shadow-[0_0_6px_#f97316]'
-                : 'bg-[#2d3436] text-[#a4b0be] hover:text-white'
-            }`}
-          >
-            <Users className="w-3 h-3" />
-            TEAMS
-          </button>
         </div>
 
-        {/* Tactile 3D Tilt & Perspective Controls (Bottom Right) */}
-        <div className="absolute bottom-4 right-4 z-20 flex flex-col gap-1.5 bg-[#1e272e]/90 backdrop-blur-[2px] p-1.5 rounded-lg border border-[#4a5568] shadow-lg select-none">
-          <button
-            type="button"
-            onClick={handleToggleTilt}
-            className={`px-2.5 py-1 text-[10px] font-mono font-bold rounded flex items-center gap-1.5 transition-all ${
-              tilt > 0
-                ? 'bg-[#38bdf8] text-[#0f172a]'
-                : 'bg-[#2d3436] text-[#f1f2f6] hover:bg-[#3d4852]'
-            }`}
-            title="Toggle 45° Oblique Satellite Perspective"
-          >
-            <Compass className="w-3 h-3" />
-            <span>{tilt > 0 ? '45° 3D TILT ON' : '45° 3D TILT'}</span>
-          </button>
+        {/* 6-Day Disaster Timeline Slider Hardware Bay (Floating Bottom Left/Center) */}
+        <div className="absolute bottom-3 left-3 right-3 sm:right-auto sm:w-[480px] z-20 bg-[#1e272e]/95 backdrop-blur-md p-3 rounded-xl border border-[#4a5568] shadow-2xl font-mono text-white space-y-2">
+          <div className="flex items-center justify-between border-b border-[#334155] pb-1.5">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-[#ff4757] animate-pulse" />
+              <span className="text-xs font-bold text-white tracking-wider">
+                6-DAY DISASTER PREDICTIVE TIMELINE
+              </span>
+            </div>
 
-          <div className="text-[9px] font-mono text-center text-[#94a3b8] px-1">
-            SCROLL / DRAG TO PAN
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setIsTimelinePlaying(!isTimelinePlaying)}
+                className="p-1 rounded bg-[#334155] hover:bg-[#475569] text-white flex items-center gap-1 text-[10px] px-2 font-bold"
+              >
+                {isTimelinePlaying ? <Pause className="w-3 h-3 text-[#22c55e]" /> : <Play className="w-3 h-3" />}
+                <span>{isTimelinePlaying ? 'PAUSE' : 'PLAY'}</span>
+              </button>
+              <span className="text-xs font-black text-[#ff4757] px-2 py-0.5 rounded bg-black/40 border border-[#ff4757]/40">
+                {forecastDay === 0 ? 'PRESENT (NOW)' : `DAY +${forecastDay}`}
+              </span>
+            </div>
+          </div>
+
+          {/* Slider Bar */}
+          <div className="space-y-1">
+            <input
+              type="range"
+              min={0}
+              max={6}
+              step={1}
+              value={forecastDay}
+              onChange={(e) => {
+                playMechanicalClick();
+                setForecastDay(parseInt(e.target.value, 10));
+              }}
+              className="w-full accent-[#ff4757] cursor-pointer"
+            />
+            <div className="flex justify-between text-[9px] text-[#94a3b8] font-bold">
+              <span>DAY 0 (NOW)</span>
+              <span>+1D</span>
+              <span>+2D</span>
+              <span>+3D</span>
+              <span>+4D</span>
+              <span>+5D</span>
+              <span>+6D</span>
+            </div>
+          </div>
+
+          <div className="text-[10px] text-[#cbd5e1] flex items-center justify-between pt-0.5">
+            <span>SWATH FORECAST: Dynamic Risk polygons & surge extents scaled</span>
+            <span className="text-[#22c55e] font-bold">PREDICTIVE AI ACTIVE</span>
           </div>
         </div>
 
-        {/* Legend strip inside bottom-left */}
-        <div className="absolute bottom-3 left-3 z-20 hidden sm:flex items-center gap-2 bg-[#1e272e]/90 backdrop-blur-[2px] px-2.5 py-1.5 rounded border border-[#4a5568] font-mono text-[10px] text-[#f1f2f6] shadow-lg">
-          <span className="font-bold text-[#94a3b8]">HAZARD RISK:</span>
+        {/* Hardware-Styled Interactive Inspector Window (Slide-Over Panel) */}
+        {inspectedItem && (
+          <div className="absolute top-3 left-3 bottom-3 w-80 sm:w-96 z-30 bg-[#1e272e]/98 backdrop-blur-lg rounded-xl border-2 border-[#ff4757] shadow-2xl p-4 font-mono text-white flex flex-col justify-between overflow-y-auto animate-fadeIn">
+            {/* Top Bar */}
+            <div className="border-b border-[#334155] pb-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold text-[#ff4757] tracking-wider uppercase">
+                  OBJECT INSPECTOR // {inspectedItem.type}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setInspectedItem(null)}
+                  className="p-1 rounded text-[#94a3b8] hover:text-white hover:bg-[#334155]"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <h3 className="text-sm font-bold text-white mt-1 leading-tight">{inspectedItem.title}</h3>
+              <p className="text-[10px] text-[#38bdf8] font-semibold">{inspectedItem.subtitle}</p>
+            </div>
+
+            {/* Live Sensor Telemetry */}
+            <div className="my-3 space-y-2">
+              <span className="text-[10px] font-bold text-[#94a3b8] uppercase">1. Live Sensor Telemetry:</span>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                {inspectedItem.telemetry.rainfallMmHr !== undefined && (
+                  <div className="well-recessed p-2 rounded bg-black/40 border border-[#334155]">
+                    <span className="text-[9px] text-gray-400 block">RAINFALL:</span>
+                    <strong className="text-white text-sm">{inspectedItem.telemetry.rainfallMmHr} mm/h</strong>
+                  </div>
+                )}
+                {inspectedItem.telemetry.windKnots !== undefined && (
+                  <div className="well-recessed p-2 rounded bg-black/40 border border-[#334155]">
+                    <span className="text-[9px] text-gray-400 block">WIND SPEED:</span>
+                    <strong className="text-white text-sm">{inspectedItem.telemetry.windKnots} Knots</strong>
+                  </div>
+                )}
+                {inspectedItem.telemetry.elevationM !== undefined && (
+                  <div className="well-recessed p-2 rounded bg-black/40 border border-[#334155]">
+                    <span className="text-[9px] text-gray-400 block">ELEVATION:</span>
+                    <strong className="text-white text-sm">{inspectedItem.telemetry.elevationM}m ASL</strong>
+                  </div>
+                )}
+                {inspectedItem.telemetry.magnitude !== undefined && (
+                  <div className="well-recessed p-2 rounded bg-black/40 border border-[#334155]">
+                    <span className="text-[9px] text-gray-400 block">SEISMIC MAG:</span>
+                    <strong className="text-[#ff4757] text-sm">M {inspectedItem.telemetry.magnitude}</strong>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Explainable Risk Logic */}
+            <div className="my-2 p-2.5 rounded-lg bg-black/50 border border-[#ff4757]/40 space-y-1">
+              <span className="text-[10px] font-bold text-[#ff4757] uppercase flex items-center gap-1">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                2. Explainable Risk Logic:
+              </span>
+              <p className="text-[11px] text-[#cbd5e1] leading-relaxed">{inspectedItem.explainableLogic}</p>
+            </div>
+
+            {/* Impact Assessment */}
+            <div className="my-2 space-y-1 text-xs">
+              <span className="text-[10px] font-bold text-[#94a3b8] uppercase">3. Impact Assessment:</span>
+              <div className="text-[11px] text-[#cbd5e1] space-y-1">
+                <div>
+                  <span className="text-gray-400">Population Exposed:</span>{' '}
+                  <strong className="text-white">{inspectedItem.impactAssessment.populationAtRisk}</strong>
+                </div>
+                <div>
+                  <span className="text-gray-400">Directive:</span>{' '}
+                  <strong className="text-amber-400">{inspectedItem.impactAssessment.evacuationDirective}</strong>
+                </div>
+              </div>
+            </div>
+
+            {/* Close Button */}
+            <button
+              type="button"
+              onClick={() => setInspectedItem(null)}
+              className="mt-3 w-full py-2 rounded-lg bg-[#334155] hover:bg-[#475569] text-white font-mono font-bold text-xs"
+            >
+              CLOSE INSPECTOR
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Legend & Telemetry Bar */}
+      <div className="flex flex-wrap items-center justify-between text-[11px] font-mono border-t border-[#babecc] pt-2 px-1 text-[#475569]">
+        <div className="flex items-center gap-3">
+          <span className="font-bold text-[#1e293b]">RISK TIERS:</span>
           <span className="flex items-center gap-1">
-            <span className="w-2 h-2 rounded-full bg-[#ff4757] shadow-[0_0_4px_#ff4757]" /> CRITICAL
+            <span className="w-2 h-2 rounded-full bg-[#ff4757]" /> CRITICAL
           </span>
           <span className="flex items-center gap-1">
             <span className="w-2 h-2 rounded-full bg-[#f97316]" /> HIGH
@@ -914,37 +898,11 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           </span>
         </div>
 
-        {/* Tactical Inspect Popup Overlay when user clicks any zone, haven, or convoy */}
-        {inspectedItem && (
-          <div className="absolute top-12 left-2 right-2 sm:right-auto sm:left-3 z-30 max-w-sm w-auto bg-[#1e272e]/95 backdrop-blur-md rounded-lg border-2 border-[#38bdf8] shadow-2xl p-3 font-mono text-xs text-[#f1f2f6] animate-fade-in">
-            <div className="flex items-center justify-between border-b border-[#4a5568] pb-1 mb-2">
-              <div className="flex items-center gap-1.5">
-                <Radio className="w-4 h-4 text-[#38bdf8]" />
-                <span className="font-bold text-[#f1f2f6] truncate">{inspectedItem.title}</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setInspectedItem(null)}
-                className="text-[#94a3b8] hover:text-white p-0.5 rounded"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-
-            <div className="text-[10px] text-[#38bdf8] font-bold mb-2 uppercase">
-              {inspectedItem.subtitle}
-            </div>
-
-            <div className="space-y-1 text-[11px]">
-              {Object.entries(inspectedItem.details).map(([key, val]) => (
-                <div key={key} className="flex justify-between gap-2 border-b border-[#334155]/50 py-0.5">
-                  <span className="text-[#94a3b8]">{key}:</span>
-                  <span className="font-bold text-right text-[#f8fafc] truncate">{val}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <span>CENTER: {currentCenter[0].toFixed(3)}°N, {currentCenter[1].toFixed(3)}°E</span>
+          <span>•</span>
+          <span>ZOOM: {currentZoom}X</span>
+        </div>
       </div>
     </div>
   );

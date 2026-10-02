@@ -174,13 +174,13 @@ export const EvacuationRoutingModule: React.FC<EvacuationRoutingModuleProps> = (
               </div>
 
               {/* Tactical Buttons */}
-              <div className="pt-2 border-t border-[#babecc]/60 flex items-center gap-2">
+              <div className="pt-2 border-t border-[#babecc]/60 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                 <TactileButton
                   size="sm"
                   variant={isImpassable ? 'standard' : 'danger'}
                   onClick={() => handleToggle(route.id)}
-                  icon={<AlertOctagon className="w-3 h-3" />}
-                  className="flex-1"
+                  icon={<AlertOctagon className="w-3.5 h-3.5 shrink-0" />}
+                  className="w-full sm:flex-1 py-2 text-center"
                 >
                   {isImpassable ? 'CLEAR ROAD BLOCKAGE' : 'SIMULATE ROAD HAZARD'}
                 </TactileButton>
@@ -190,8 +190,8 @@ export const EvacuationRoutingModule: React.FC<EvacuationRoutingModuleProps> = (
                   variant={route.isDetourActive ? 'orange' : 'standard'}
                   active={route.isDetourActive}
                   onClick={() => handleDetour(route.id)}
-                  icon={<RotateCcw className="w-3 h-3" />}
-                  className="flex-1"
+                  icon={<RotateCcw className="w-3.5 h-3.5 shrink-0" />}
+                  className="w-full sm:flex-1 py-2 text-center font-bold"
                 >
                   {route.isDetourActive ? 'DISENGAGE DETOUR' : 'CALCULATE DETOUR'}
                 </TactileButton>

@@ -282,15 +282,41 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
             <div className="space-y-1.5 font-mono text-xs mb-4">
               <button
                 type="button"
-                onClick={() => handleTabClick('all')}
+                onClick={() => handleTabClick('matrix')}
                 className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
-                  activeTab === 'all'
+                  activeTab === 'matrix'
                     ? 'bg-[#2d3436] text-white border-[#ff4757]'
                     : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
                 }`}
               >
-                <span>FULL CONSOLE OVERVIEW (ALL)</span>
-                <span className="text-[10px] text-gray-400">All Modules</span>
+                <span>M1-B: WEATHER & HAZARD CHRONO</span>
+                <span className="text-[10px] text-gray-400">Timelines</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTabClick('map')}
+                className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
+                  activeTab === 'map'
+                    ? 'bg-[#2d3436] text-white border-[#ff4757]'
+                    : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
+                }`}
+              >
+                <span>TACTICAL MAP (GIS)</span>
+                <span className="text-[10px] text-gray-400">Google Maps</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTabClick('ingestion')}
+                className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
+                  activeTab === 'ingestion'
+                    ? 'bg-[#2d3436] text-white border-[#ff4757]'
+                    : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
+                }`}
+              >
+                <span>M1: DATA INGESTION & SENSORS</span>
+                <span className="text-[10px] text-gray-400">Telemetry</span>
               </button>
 
               <button
@@ -343,6 +369,45 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
               >
                 <span>M6: LIVE INCIDENT EVENT FEED</span>
                 <span className="text-[10px] text-gray-400">Logs</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTabClick('copilot')}
+                className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
+                  activeTab === 'copilot'
+                    ? 'bg-[#2d3436] text-white border-[#ff4757]'
+                    : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
+                }`}
+              >
+                <span className="text-[#ff4757] font-bold">M7: GEMINI AI COPILOT</span>
+                <span className="text-[10px] text-gray-400">Ask Anything</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTabClick('advisory')}
+                className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
+                  activeTab === 'advisory'
+                    ? 'bg-[#2d3436] text-white border-[#38bdf8]'
+                    : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
+                }`}
+              >
+                <span className="text-[#38bdf8] font-bold">M8: 7-DAY WEATHER FORECAST</span>
+                <span className="text-[10px] text-gray-400">Meteorological Watch</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTabClick('all')}
+                className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between ${
+                  activeTab === 'all'
+                    ? 'bg-[#2d3436] text-white border-[#ff4757]'
+                    : 'bg-white/80 text-[#1e293b] border-[#cbd5e1]'
+                }`}
+              >
+                <span>FULL CONSOLE OVERVIEW (ALL)</span>
+                <span className="text-[10px] text-gray-400">All Modules</span>
               </button>
             </div>
 

@@ -9,6 +9,7 @@ interface TactileButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
   soundType?: 'click' | 'relay';
   icon?: React.ReactNode;
   badge?: string | number;
+  truncate?: boolean;
 }
 
 export const TactileButton: React.FC<TactileButtonProps> = ({
@@ -20,6 +21,7 @@ export const TactileButton: React.FC<TactileButtonProps> = ({
   soundType = 'click',
   icon,
   badge,
+  truncate = false,
   className = '',
   onClick,
   disabled,
@@ -76,7 +78,7 @@ export const TactileButton: React.FC<TactileButtonProps> = ({
         />
       )}
       {icon && <span className="shrink-0">{icon}</span>}
-      <span className="truncate">{children}</span>
+      <span className={truncate ? 'truncate' : 'whitespace-normal text-center'}>{children}</span>
       {badge !== undefined && (
         <span className="ml-1 px-1.5 py-0.2 text-[10px] rounded bg-[#2d3436] text-[#e0e5ec] font-mono font-bold">
           {badge}

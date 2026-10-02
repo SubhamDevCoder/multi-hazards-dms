@@ -29,6 +29,7 @@ import { ResourcePlanningModule } from './components/modules/ResourcePlanningMod
 import { EvacuationRoutingModule } from './components/modules/EvacuationRoutingModule';
 import { EventStreamModule } from './components/modules/EventStreamModule';
 import { GeminiChatBotModule } from './components/modules/GeminiChatBotModule';
+import { MultimodalAdvisory } from './components/modules/MultimodalAdvisory';
 import { EmergencyBroadcastModal } from './components/modals/EmergencyBroadcastModal';
 import { TactileAiCopilotDrawer } from './components/modals/TactileAiCopilotDrawer';
 import {
@@ -43,6 +44,8 @@ import {
   HelpCircle,
   Bot,
   Clock,
+  Sprout,
+  CloudRain,
 } from 'lucide-react';
 import { playMechanicalClick, playAlarmChirp, playSuccessChime } from './utils/audio';
 import { formatTimeHHMMSS, formatTimeHHMM, addHours, addMinutes } from './utils/timeFormatters';
@@ -89,8 +92,16 @@ export default function App() {
 
   // Active module view navigation
   const [activeTab, setActiveTab] = useState<
-    'all' | 'map' | 'matrix' | 'ingestion' | 'risk' | 'resources' | 'evac' | 'logs' | 'copilot'
-  >('all');
+    'all' | 'map' | 'matrix' | 'ingestion' | 'risk' | 'resources' | 'evac' | 'logs' | 'copilot' | 'advisory'
+  >('matrix');
+
+  // Google Maps Platform Quota Exceeded Defense
+  const [quotaExceeded, setQuotaExceeded] = useState(false);
+  useEffect(() => {
+    const handleQuota = () => setQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuota);
+  }, []);
 
   // Simulation loop toggle
   const [isSimulating, setIsSimulating] = useState(true);
@@ -304,7 +315,6 @@ export default function App() {
   }[currentHazard];
 
   const navItems: { id: typeof activeTab; label: string; icon: React.ReactNode }[] = [
-    { id: 'all', label: 'FULL CONSOLE VIEW', icon: <LayoutDashboard className="w-4 h-4" /> },
     { id: 'matrix', label: 'M1-B: WEATHER & HAZARD CHRONO', icon: <Clock className="w-4 h-4 text-[#ff4757]" /> },
     { id: 'map', label: 'TACTICAL MAP', icon: <Map className="w-4 h-4" /> },
     { id: 'ingestion', label: 'M1: DATA INGESTION', icon: <Activity className="w-4 h-4" /> },
@@ -313,10 +323,30 @@ export default function App() {
     { id: 'evac', label: 'M5: EVAC ROUTING', icon: <Navigation className="w-4 h-4" /> },
     { id: 'logs', label: 'M6: INCIDENT STREAM', icon: <Terminal className="w-4 h-4" /> },
     { id: 'copilot', label: 'M7: GEMINI COPILOT', icon: <Bot className="w-4 h-4" /> },
+    { id: 'advisory', label: 'M8: 7-DAY WEATHER FORECAST', icon: <CloudRain className="w-4 h-4 text-[#38bdf8]" /> },
+    { id: 'all', label: 'FULL CONSOLE VIEW', icon: <LayoutDashboard className="w-4 h-4" /> },
   ];
 
   return (
     <div className="min-h-screen bg-[#e0e5ec] text-[#2d3436] flex flex-col font-sans">
+      {/* Sticky Google Maps Quota Defense Banner if Quota Exceeded */}
+      {quotaExceeded && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm font-mono">
+          <span>
+            Google Maps Platform quota reached. If you are the app owner, visit{' '}
+            <a
+              href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline font-semibold text-amber-950 hover:text-amber-800"
+            >
+              maps developer site
+            </a>{' '}
+            for instructions to update your account.
+          </span>
+        </div>
+      )}
+
       {/* Top Console Status Bar */}
       <ConsoleHeader
         defconLevel={dataset.defconLevel}
@@ -336,7 +366,7 @@ export default function App() {
       {/* Main Console Workspace */}
       <div className="flex-1 max-w-[1720px] w-full mx-auto p-2 sm:p-3 lg:p-4 grid grid-cols-1 lg:grid-cols-12 gap-3 lg:gap-4 pb-20 lg:pb-4">
         {/* Left Physical Key Navigation & Hardware Selector (Desktop 3 Cols, hidden on mobile) */}
-        <div className="hidden lg:flex lg:col-span-3 flex-col gap-4">
+        <div className="hidden lg:flex lg:col-span-3 flex-col gap-4 max-h-[calc(100vh-80px)] overflow-y-auto pr-1">
           {/* Module 6 & 7: Dynamic Hazard Switcher Rotary Selector */}
           <RotarySelector
             currentHazard={currentHazard}
@@ -389,7 +419,7 @@ export default function App() {
         </div>
 
         {/* Center / Right Command Modules (9 Cols on desktop, full width on mobile) */}
-        <div className="lg:col-span-9 flex flex-col gap-3 lg:gap-4">
+        <div className="lg:col-span-9 flex flex-col gap-3 lg:gap-4 min-w-0">
           {/* Mobile Quick Scenario Selector Strip (lg:hidden) */}
           <div className="lg:hidden p-2.5 rounded-xl panel-raised border border-[#babecc] flex items-center justify-between shadow-sm">
             <div className="flex items-center gap-2">
@@ -414,6 +444,31 @@ export default function App() {
             >
               CHANGE SCENARIO ↻
             </button>
+          </div>
+
+          {/* Mobile Scrollable Module Options Rail (lg:hidden) */}
+          <div className="lg:hidden p-1.5 rounded-xl well-recessed border border-[#babecc] flex items-center gap-1.5 overflow-x-auto no-scrollbar scroll-smooth">
+            {navItems.map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    playMechanicalClick();
+                    setActiveTab(item.id);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg font-mono text-[11px] font-bold shrink-0 flex items-center gap-1.5 transition-all active:scale-95 whitespace-nowrap ${
+                    isActive
+                      ? 'bg-[#2d3436] text-white border border-[#ff4757] shadow-md'
+                      : 'bg-white/80 text-[#475569] border border-[#cbd5e1] hover:text-[#1e293b]'
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${isActive ? 'bg-[#ff4757] animate-pulse' : 'bg-[#94a3b8]'}`} />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
           </div>
           {/* Tactical Map (Visible in ALL view or MAP view) */}
           {(activeTab === 'all' || activeTab === 'map') && (
@@ -520,6 +575,14 @@ export default function App() {
               weather={weather}
               riverGauge={riverGauge}
               onPostToLog={handleAddManualLog}
+            />
+          )}
+
+          {/* Module 8: Multimodal Advisory (7-Day Crop Weather & Search Grounding) */}
+          {(activeTab === 'all' || activeTab === 'advisory') && (
+            <MultimodalAdvisory
+              currentLocationName={dataset.title}
+              coordinates={dataset.mapCenter}
             />
           )}
         </div>

@@ -174,11 +174,11 @@ export const EventStreamModule: React.FC<EventStreamModuleProps> = ({
       </div>
 
       {/* Manual Transmission Dispatch Input Bar */}
-      <form onSubmit={handleSendManual} className="flex flex-wrap items-center gap-2 pt-1 border-t border-[#babecc]/50">
+      <form onSubmit={handleSendManual} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1 border-t border-[#babecc]/50">
         <select
           value={manualSeverity}
           onChange={(e) => setManualSeverity(e.target.value as 'CRIT' | 'WARN' | 'INFO')}
-          className="text-[10px] font-mono font-bold bg-[#f0f2f5] border border-[#babecc] rounded px-2 py-1.5 text-[#2d3436]"
+          className="text-[10px] font-mono font-bold bg-[#f0f2f5] border border-[#babecc] rounded px-2 py-1.5 text-[#2d3436] shrink-0"
         >
           <option value="WARN">WARN // ADVISORY</option>
           <option value="CRIT">CRIT // EMERGENCY</option>
@@ -190,7 +190,7 @@ export const EventStreamModule: React.FC<EventStreamModuleProps> = ({
           placeholder="TYPE MANUAL DISPATCH ORDER TO LOG & BROADCAST FREQUENCY..."
           value={manualMessage}
           onChange={(e) => setManualMessage(e.target.value)}
-          className="flex-1 min-w-[200px] px-3 py-1.5 rounded well-recessed border border-[#babecc] text-[11px] font-mono text-[#2d3436] placeholder:text-[#747d8c] focus:outline-none"
+          className="flex-1 w-full min-w-0 px-3 py-1.5 rounded well-recessed border border-[#babecc] text-[11px] font-mono text-[#2d3436] placeholder:text-[#747d8c] focus:outline-none"
         />
 
         <TactileButton
@@ -199,6 +199,7 @@ export const EventStreamModule: React.FC<EventStreamModuleProps> = ({
           variant="orange"
           soundType="relay"
           icon={<Send className="w-3.5 h-3.5" />}
+          className="w-full sm:w-auto shrink-0"
         >
           TRANSMIT
         </TactileButton>
